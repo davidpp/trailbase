@@ -328,7 +328,7 @@ fn lookup_and_parse_all_view_schemas_sqlite(
 
     for row in conn.query_rows(&query, ())? {
       let sql: String = row.get(0)?;
-      match sqlite3_parse_view(&sql, tables) {
+      match sqlite3_parse_view(&sql, tables, &db.name) {
         Ok(mut view) => {
           view.name.database_schema = Some(db.name.clone());
           views.push(view);
@@ -343,7 +343,11 @@ fn lookup_and_parse_all_view_schemas_sqlite(
   return Ok(views);
 }
 
-fn sqlite3_parse_view(sql: &str, tables: &[Table]) -> Result<View, SchemaLookupError> {
+fn sqlite3_parse_view(
+  sql: &str,
+  tables: &[Table],
+  database_schema: &str,
+) -> Result<View, SchemaLookupError> {
   let allocator = sqlite3_parser::Bump::new();
   let mut parser = sqlite3_parser::lexer::sql::Parser::new(&allocator, sql.as_bytes());
   match parser.next()? {
@@ -351,7 +355,7 @@ fn sqlite3_parse_view(sql: &str, tables: &[Table]) -> Result<View, SchemaLookupE
     Some(cmd) => {
       use sqlite3_parser::ast::Cmd;
       match cmd {
-        Cmd::Stmt(stmt) => Ok(View::from(stmt, tables)?),
+        Cmd::Stmt(stmt) => Ok(View::from(stmt, tables, Some(database_schema))?),
         Cmd::Explain(_) | Cmd::ExplainQueryPlan(_) => Err(SchemaLookupError::InvalidSqlStatement),
       }
     }

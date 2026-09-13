@@ -705,12 +705,26 @@ mod tests {
     return (&create_table_statement).try_into().unwrap();
   }
 
+  fn parse_create_table_in_database(create_table_sql: &str, database_schema: &str) -> Table {
+    let mut table = parse_create_table(create_table_sql);
+    table.name.database_schema = Some(database_schema.to_string());
+    return table;
+  }
+
   fn parse_create_view(create_view_sql: &str, tables: &[Table]) -> Result<View, SchemaError> {
+    return parse_create_view_in_database(create_view_sql, tables, None);
+  }
+
+  fn parse_create_view_in_database(
+    create_view_sql: &str,
+    tables: &[Table],
+    database_schema: Option<&str>,
+  ) -> Result<View, SchemaError> {
     let allocator = Bump::new();
     let create_view_statement = parse_into_statement(&allocator, create_view_sql)
       .unwrap()
       .unwrap();
-    return View::from(create_view_statement, tables);
+    return View::from(create_view_statement, tables, database_schema);
   }
 
   #[test]
@@ -1016,6 +1030,82 @@ mod tests {
         let metadata = ViewMetadata::new(&registry, view, &tables).unwrap();
         assert_eq!(Some(1), metadata.record_pk_column().map(|c| c.index));
       }
+    }
+  }
+
+  #[test]
+  fn test_parse_create_view_in_attached_database() {
+    const PRODUCTS: &str =
+      "CREATE TABLE products (id INTEGER PRIMARY KEY, name TEXT, price REAL) STRICT";
+
+    let registry = JsonSchemaRegistry::from_schemas(vec![]);
+    let attached_tables = [parse_create_table_in_database(PRODUCTS, "botdb")];
+    let main_tables = [parse_create_table_in_database(PRODUCTS, "main")];
+
+    let assert_inferred = |view: View| {
+      let metadata = ViewMetadata::new(&registry, view, &attached_tables).unwrap();
+
+      let columns = metadata.columns().unwrap();
+      assert_eq!(
+        vec!["id", "name", "price"],
+        columns
+          .iter()
+          .map(|c| c.column.name.as_str())
+          .collect::<Vec<_>>()
+      );
+      assert_eq!(Some(0), metadata.record_pk_column().map(|c| c.index));
+    };
+
+    {
+      // Unqualified references resolve within the VIEW's own database, `SELECT *` expands via the
+      // same lookup.
+      for body in [
+        "SELECT id, name, price FROM products",
+        "SELECT * FROM products",
+      ] {
+        let sql = format!("CREATE VIEW cheap AS {body} WHERE price < 10.0");
+        let view = parse_create_view_in_database(&sql, &attached_tables, Some("botdb")).unwrap();
+
+        assert_inferred(view);
+      }
+    }
+
+    {
+      // Explicitly qualified references keep resolving.
+      let view = parse_create_view_in_database(
+        "CREATE VIEW cheap AS SELECT * FROM botdb.products WHERE price < 10.0",
+        &attached_tables,
+        Some("botdb"),
+      )
+      .unwrap();
+
+      assert_inferred(view);
+    }
+
+    {
+      // VIEWs in `main` are unaffected, both with and without an explicit database.
+      for database_schema in [None, Some("main")] {
+        let view = parse_create_view_in_database(
+          "CREATE VIEW cheap AS SELECT * FROM products WHERE price < 10.0",
+          &main_tables,
+          database_schema,
+        )
+        .unwrap();
+
+        assert!(view.column_mapping.is_some(), "{database_schema:?}");
+      }
+    }
+
+    {
+      // A VIEW must not reach across the attach boundary: `products` lives in `main` only.
+      let view = parse_create_view_in_database(
+        "CREATE VIEW cheap AS SELECT * FROM products WHERE price < 10.0",
+        &main_tables,
+        Some("botdb"),
+      )
+      .unwrap();
+
+      assert!(view.column_mapping.is_none());
     }
   }
 

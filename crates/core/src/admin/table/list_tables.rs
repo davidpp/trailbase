@@ -259,7 +259,7 @@ async fn list_tables_handler_sqlite_impl(
 
             response.views.push((
               {
-                let mut view = View::from(create_view_statement, &tables)?;
+                let mut view = View::from(create_view_statement, &tables, db_schema.as_deref())?;
                 view.name.database_schema = db_schema;
                 view
               },

@@ -926,7 +926,11 @@ pub struct View {
 }
 
 impl View {
-  pub fn from(stmt: sqlite3_parser::ast::Stmt, tables: &[Table]) -> Result<Self, SchemaError> {
+  pub fn from(
+    stmt: sqlite3_parser::ast::Stmt,
+    tables: &[Table],
+    database_schema: Option<&str>,
+  ) -> Result<Self, SchemaError> {
     let sqlite3_parser::ast::Stmt::CreateView {
       temporary,
       if_not_exists,
@@ -953,7 +957,7 @@ impl View {
       // Try to parse columns very liberally. We don't want to disallow complex
       // VIEWs but returning a `View` with `None` columns, means it cannot be used
       // for APIs.
-      extract_column_mapping(select, tables)
+      extract_column_mapping(select, tables, database_schema)
         .map_err(|err| {
           debug!(
             "Failed to extract VIEW column mapping from '{:?}': {err}",
@@ -1010,12 +1014,13 @@ pub struct ColumnMapping {
 fn extract_column_mapping<'b>(
   select: &sqlite3_parser::ast::Select<'b>,
   tables: &[Table],
+  database_schema: Option<&str>,
 ) -> Result<ColumnMapping, SchemaError> {
   let result_columns = extract_result_columns(select)?;
   let group_by_key_candidate = extract_group_by_key_candidate(select)?;
 
   let (joins, referenced_table_by_alias) =
-    extract_joins_and_referenced_tables_by_alias(select, tables)?;
+    extract_joins_and_referenced_tables_by_alias(select, tables, database_schema)?;
 
   let find_table_by_alias = |a: &str| -> Result<&ReferredTable, SchemaError> {
     return referenced_table_by_alias
@@ -1304,9 +1309,20 @@ pub(crate) struct ReferredTable {
   pub(crate) table: Table,
 }
 
+fn name_with_database(name: &QualifiedName, database_schema: Option<&str>) -> QualifiedName {
+  return QualifiedName {
+    name: name.name.clone(),
+    database_schema: name
+      .database_schema
+      .clone()
+      .or_else(|| database_schema.map(str::to_string)),
+  };
+}
+
 fn extract_joins_and_referenced_tables_by_alias(
   select: &sqlite3_parser::ast::Select,
   tables: &[Table],
+  database_schema: Option<&str>,
 ) -> Result<(Vec<u8>, Vec<ReferredTable>), SchemaError> {
   let body = &select.body;
   if body.compounds.is_some() {
@@ -1348,7 +1364,12 @@ fn extract_joins_and_referenced_tables_by_alias(
   };
 
   let find_table = |qualified_name: &QualifiedName| -> Result<&Table, SchemaError> {
-    let Some(table) = tables.iter().find(|t| t.name == *qualified_name) else {
+    // SQLite strips the schema qualifier when storing a VIEW and forbids VIEWs from referencing
+    // objects in other databases, i.e. an unqualified name resolves within the VIEW's own database:
+    //   https://www.sqlite.org/lang_createview.html
+    let qualified_name = name_with_database(qualified_name, database_schema);
+
+    let Some(table) = tables.iter().find(|t| t.name == qualified_name) else {
       return Err(precondition(&format!("Missing table: {qualified_name:?}")));
     };
 
@@ -1397,7 +1418,7 @@ fn extract_joins_and_referenced_tables_by_alias(
               let alias = to_alias(alias);
 
               let (joins_in_subselect, referenced_tables_in_subselect) =
-                extract_joins_and_referenced_tables_by_alias(subselect, tables)?;
+                extract_joins_and_referenced_tables_by_alias(subselect, tables, database_schema)?;
 
               all_joins.extend(joins_in_subselect);
               referenced_tables.extend(referenced_tables_in_subselect.into_iter().map(
@@ -1422,7 +1443,7 @@ fn extract_joins_and_referenced_tables_by_alias(
       // Simply recurse tu unnest the select.
       let alias = to_alias(alias);
       let (joins_in_nested_select, referenced_tables_in_nested_select) =
-        extract_joins_and_referenced_tables_by_alias(nested_select, tables)?;
+        extract_joins_and_referenced_tables_by_alias(nested_select, tables, database_schema)?;
 
       return Ok((
         joins_in_nested_select,
@@ -1904,19 +1925,19 @@ mod tests {
     {
       // No alias
       let select = parse_into_select(&allocator, "SELECT column FROM table_name");
-      let _mapping = extract_column_mapping(&select, &tables).unwrap();
+      let _mapping = extract_column_mapping(&select, &tables, None).unwrap();
     }
 
     {
       // With alias
       let select = parse_into_select(&allocator, "SELECT alias.column FROM table_name AS alias");
-      let _mapping = extract_column_mapping(&select, &tables).unwrap();
+      let _mapping = extract_column_mapping(&select, &tables, None).unwrap();
     }
 
     {
       // With "elided" alias
       let select = parse_into_select(&allocator, "SELECT alias.column FROM table_name alias");
-      let _mapping = extract_column_mapping(&select, &tables).unwrap();
+      let _mapping = extract_column_mapping(&select, &tables, None).unwrap();
     }
 
     {
@@ -1928,7 +1949,7 @@ mod tests {
           FROM table_name AS x LEFT JOIN (SELECT * FROM table_name) AS y ON x.column = y.column
         ",
       );
-      let mapping = extract_column_mapping(&select, &tables).unwrap();
+      let mapping = extract_column_mapping(&select, &tables, None).unwrap();
 
       let got: Vec<C> = mapping
         .columns
@@ -1978,7 +1999,7 @@ mod tests {
         &allocator,
         "SELECT column FROM table_name UNION SELECT column FROM table_name",
       );
-      let err = extract_column_mapping(&select, &tables)
+      let err = extract_column_mapping(&select, &tables, None)
         .err()
         .unwrap()
         .to_string();
@@ -2021,7 +2042,9 @@ mod tests {
     );
     assert_eq!(
       Some(0),
-      extract_column_mapping(select, &tables).unwrap().group_by
+      extract_column_mapping(select, &tables, None)
+        .unwrap()
+        .group_by
     );
 
     let select = parse_create_view_select(
@@ -2030,7 +2053,9 @@ mod tests {
     );
     assert_eq!(
       Some(0),
-      extract_column_mapping(select, &tables).unwrap().group_by
+      extract_column_mapping(select, &tables, None)
+        .unwrap()
+        .group_by
     );
 
     // With function
@@ -2038,7 +2063,7 @@ mod tests {
       &allocator,
       "CREATE VIEW view2 AS SELECT min(id) AS id, data FROM a GROUP BY data",
     );
-    let column_mapping = extract_column_mapping(select, &tables).unwrap();
+    let column_mapping = extract_column_mapping(select, &tables, None).unwrap();
     let pk = find_record_pk_column_index_for_view(&column_mapping, &tables);
     assert_eq!(Some(0), pk);
     assert_eq!(Some(1), column_mapping.group_by);
@@ -2076,7 +2101,7 @@ mod tests {
         LEFT JOIN bar.profiles AS p ON p.user = a.author
       ",
     );
-    let mapping = extract_column_mapping(&select, &tables).unwrap();
+    let mapping = extract_column_mapping(&select, &tables, None).unwrap();
 
     let got: Vec<C> = mapping
       .columns
